@@ -62,8 +62,14 @@ libraryDependencies ++= Seq(
   Libraries.circeGenericExt,
   Libraries.circeParser,
   Libraries.pureConfig,
+  Libraries.sttp,
+  Libraries.sttpCirce,
+  Libraries.redisClient,
   Libraries.logback,
   Libraries.scalaTest      % Test,
   Libraries.scalaCheck     % Test,
   Libraries.catsScalaCheck % Test
 )
+
+mainClass := Some("forex.Main")
+assembly := (assembly dependsOn dependencyUpdates).value

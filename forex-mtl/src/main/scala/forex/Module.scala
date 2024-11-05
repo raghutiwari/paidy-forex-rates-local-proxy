@@ -1,21 +1,54 @@
 package forex
 
-import cats.effect.{ Concurrent, Timer }
+import cats.effect.{ Async, Concurrent, Resource, Timer }
+import cats.implicits.catsSyntaxApplicativeError
+import forex.cache.RedisCurrencyRateCache
 import forex.config.ApplicationConfig
+import forex.http.rateLimiter.RedisRateLimiter
+import forex.http.rateLimiter.interpreters.RateLimiterAlgebra
 import forex.http.rates.RatesHttpRoutes
 import forex.services._
 import forex.programs._
+import forex.services.rates.token.{ RedisTokenCache, TokenCacheAlgebra, TokenProvider }
 import org.http4s._
 import org.http4s.implicits._
 import org.http4s.server.middleware.{ AutoSlash, Timeout }
+import org.slf4j.LoggerFactory
+import redis.clients.jedis.Jedis
+import sttp.client3.{ HttpURLConnectionBackend, Identity, SttpBackend }
 
 class Module[F[_]: Concurrent: Timer](config: ApplicationConfig) {
 
-  private val ratesService: RatesService[F] = RatesServices.dummy[F]
+  private val logger = LoggerFactory.getLogger(getClass)
+
+  val backend: SttpBackend[Identity, Any] = HttpURLConnectionBackend()
+
+  private val jedisResource: Resource[F, Jedis] = Resource.make(
+    Async[F].delay(new Jedis(config.redis.host, config.redis.port)) // Acquire the resource
+  ) { jedis =>
+    Async[F].delay(jedis.close()).handleErrorWith { e =>
+      logger.error("Failed to close jedis resource", e)
+      Async[F].unit
+    }
+  }
+
+  private val currencyCache: RedisCurrencyRateCache[F] = new RedisCurrencyRateCache[F](jedisResource)
+
+  private val oneFrameTokensCache: F[TokenCacheAlgebra[F]] =
+    RedisTokenCache[F](
+      jedisResource,
+      config.oneFrame.http.token
+    )
+
+  private val tokenProvider: TokenProvider[F] = new TokenProvider[F](oneFrameTokensCache)
+
+  private val ratesService: RatesService[F] = RatesServices.live(config.oneFrame, backend, currencyCache, tokenProvider)
 
   private val ratesProgram: RatesProgram[F] = RatesProgram[F](ratesService)
 
-  private val ratesHttpRoutes: HttpRoutes[F] = new RatesHttpRoutes[F](ratesProgram).routes
+  val ratesLimiter: F[RateLimiterAlgebra[F]] = RedisRateLimiter[F](jedisResource, config.rateLimit, config.http.tokens)
+
+  private val ratesHttpRoutes: HttpRoutes[F] = new RatesHttpRoutes[F](ratesProgram, ratesLimiter).routes
 
   type PartialMiddleware = HttpRoutes[F] => HttpRoutes[F]
   type TotalMiddleware   = HttpApp[F] => HttpApp[F]
